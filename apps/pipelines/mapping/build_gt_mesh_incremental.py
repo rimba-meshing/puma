@@ -3,6 +3,7 @@
 import csv
 import glob
 import os
+import time
 from collections import deque
 from pathlib import Path
 
@@ -33,7 +34,13 @@ from puma.utils import (
     "--n_scans", "-n", type=int, default=-1, help="Number of scans to integrate"
 )
 @click.option("--sequence", "-s", type=str, default="00")
-def main(config, dataset, n_scans, sequence):
+@click.option(
+    "--timing-file",
+    type=click.Path(dir_okay=False),
+    default="",
+    help="Optional CSV for per-frame compute timing, excluding point-cloud reads and final mesh write.",
+)
+def main(config, dataset, n_scans, sequence, timing_file):
     """Similar to the slam/puma_pipeline.py but uses GT poses intead of
     estimate the ego-motion of the vehivle. Build an incremental map using
     the same technique used in the original puma pipeline."""
@@ -75,16 +82,21 @@ def main(config, dataset, n_scans, sequence):
     scan_count = 0
     map_count = 0
     pbar = get_progress_bar(1, n_scans)
+    timing_rows = []
     for idx in pbar:
         str_size = print_progress(pbar, idx, n_scans)
-        scan = preprocess(o3d.io.read_point_cloud(scan_names[idx]), config)
+        scan = o3d.io.read_point_cloud(scan_names[idx])
+        frame_started = time.perf_counter()
+        scan = preprocess(scan, config)
         poses.append(gt_poses[idx])
         scan.transform(poses[-1])
         local_map.append(scan)
 
         scan_count += 1
+        mesh_rebuilt = False
         if scan_count >= config.acc_frame_count or idx == n_scans - 1:
             scan_count = 0
+            mesh_rebuilt = True
             msg = "[scan #{}] Running PSR over local_map".format(idx)
             pbar.set_description(msg.rjust(str_size))
             mesh, _ = create_mesh_from_map(
@@ -92,8 +104,10 @@ def main(config, dataset, n_scans, sequence):
             )
 
         map_count += 1
+        global_merge = False
         if map_count >= config.acc_map_count or idx == n_scans - 1:
             map_count = 0
+            global_merge = True
             global_mesh += mesh
             global_mesh = global_mesh.remove_duplicated_triangles()
             global_mesh = global_mesh.remove_duplicated_vertices()
@@ -102,11 +116,30 @@ def main(config, dataset, n_scans, sequence):
             size_mb = get_mesh_size_mb(global_mesh)
             csv_writer.writerow([idx, vertices, triangles, size_mb])
 
+        timing_rows.append(
+            {
+                "frame_index": idx,
+                "compute_ms": (time.perf_counter() - frame_started) * 1000.0,
+                "mesh_rebuilt": int(mesh_rebuilt),
+                "global_merge": int(global_merge),
+                "local_map_scans": len(local_map),
+                "global_vertices": len(global_mesh.vertices),
+                "global_triangles": len(global_mesh.triangles),
+            }
+        )
+
     # Save map to file
     mesh_map_file = os.path.join(config.out_dir, map_name + ".ply")
     print("Saving Map to", mesh_map_file)
     o3d.io.write_triangle_mesh(mesh_map_file, global_mesh)
     csv_file.close()
+    if timing_file and timing_rows:
+        timing_path = Path(timing_file)
+        timing_path.parent.mkdir(parents=True, exist_ok=True)
+        with timing_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(timing_rows[0]))
+            writer.writeheader()
+            writer.writerows(timing_rows)
 
 
 if __name__ == "__main__":
